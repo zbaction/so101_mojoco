@@ -13,6 +13,15 @@ No human input is involved: each state tests its own completion condition and
 hands over to the next one.  If the grasp slips, the machine retries from
 state 1 (aiming at the cube where it actually lies now), up to MAX_ATTEMPTS.
 
+Completion is tested on the thing that actually has to happen, never on a fixed
+timer, and never on a quantity that physically cannot converge:
+
+  * a state ends when the arm joints reach their target, or when they stop
+    improving (a jammed arm would otherwise wait forever);
+  * the two states that carry the cube compare the gripper COMMAND, because the
+    jaw is jammed on the cube and can never reach it;
+  * OPEN ends when the cube has landed and stopped, not after a fixed delay.
+
 Two facts drive the geometry, both measured in this scene:
 
   * the pinch centre of the fingers sits PINCH_OFFSET ahead of the tool site
@@ -31,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Callable
@@ -57,10 +67,23 @@ GRIPPER_CLOSE = -0.10       # rad: squeezes the pads onto the cube
 GRIPPER_RELEASE = 0.60      # opens fully so the cube drops
 
 # --- motion limits ------------------------------------------------------
-MAX_JOINT_SPEED = 1.2       # rad/s on the joint reference ramp
-GRIPPER_SPEED = 0.5         # rad/s on the gripper reference ramp
-SETTLE_TOL = 0.02           # rad: a state is done when every joint is this close
-MIN_DWELL = 0.60            # s: ignore "already there" right after a transition
+MAX_JOINT_SPEED = 4.0       # rad/s on the joint reference ramp
+GRIPPER_SPEED = 1.6         # rad/s on the gripper reference ramp (jaw free)
+GRIPPER_HOLD_SPEED = 2.2    # rad/s while the pads are jammed on a payload
+GRIPPER_RELEASE_SPEED = 0.45  # rad/s when opening over the bin.  Opening fast
+                              # makes the pads flick the cube ~13 mm off target,
+                              # so this one stays deliberately slow.
+GRIPPER_SETTLE = 0.06       # rad: how close the jaw, or its command, must get
+SETTLE_TOL = 0.03           # rad: a state is done when every joint is this close
+MIN_DWELL = 0.15            # s: ignore "already there" right after a transition
+DESCEND_SPEED = 0.45        # rad/s: the final few cm down are the delicate part
+DESCEND_FAST = 2.4          # rad/s: free travel down while still above the cube
+DESCEND_FREE_Z = 0.032      # m: TCP height where the slow final descent starts
+NUDGE_LIMIT = 0.0025        # m: cube displacement that means the fingers bumped it
+STALL_WINDOW = 0.30         # s: if the joints stop making progress for this long
+STALL_PROGRESS = 0.002      # rad: ...and improve by less than this, the motion
+                            #      is jammed (fingers on the cube, table, ...)
+                            #      and the state ends instead of waiting forever
 MAX_ATTEMPTS = 3
 LIFT_SUCCESS = 0.030        # m: cube rise that counts as a successful grasp
 OFFSET_TRIM = (-0.004, 0.004)   # m: lateral nudges used by the retries
@@ -193,10 +216,20 @@ class PickPlace:
         self.cube_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"cube_{cube}")
         self.cube_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"geom_cube_{cube}")
         self.bin_site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "bin_center")
+        cube_jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"cube_{cube}")
+        self.cube_dadr = int(model.jnt_dofadr[cube_jid])
         self.finger_geoms = self._finger_geom_ids()
         self.viewer = viewer
         self.frame_dir = frame_dir
         self.renderer = None
+        # With a viewer open the run should be watchable, so hold the wall
+        # clock to the simulation clock.  Headless runs go flat out.
+        self.realtime = viewer is not None
+        self._wall0 = None
+        self._sim0 = 0.0
+        self.aborted = False
+        self._last_sync = -1.0
+        self.viewer_period = 1.0 / 60.0     # s of simulated time between redraws
         self.report = Report(cube=cube)
 
         self.q_ref = self.arm.joints()
@@ -206,6 +239,11 @@ class PickPlace:
         self.trim = 0.0
         self._stall = 0
         self._q_target = self.q_ref.copy()
+        self._best_err = float("inf")
+        self._best_time = 0.0
+        self._jammed = False
+        self._anchor = None
+        self._replans = 0
 
         if frame_dir:
             os.makedirs(frame_dir, exist_ok=True)
@@ -223,6 +261,18 @@ class PickPlace:
 
     def cube_pos(self) -> np.ndarray:
         return self.data.xpos[self.cube_body].copy()
+
+    def cube_yaw(self) -> float:
+        """Yaw of the cube about world z, folded into [0, pi/2).
+
+        The pads are parallel plates and the cube is a box, so a rotation of
+        90 degrees is the same grasp.  Squaring the pads up with the cube faces
+        (instead of always closing along +x) is what makes the grip robust: on
+        a corner-first approach the pads only touch two opposite corners and
+        the cube squirts out sideways.
+        """
+        m = self.data.xmat[self.cube_body].reshape(3, 3)
+        return float(np.arctan2(m[1, 0], m[0, 0]) % (np.pi / 2))
 
     def bin_center(self) -> np.ndarray:
         return self.data.site_xpos[self.bin_site].copy()
@@ -243,28 +293,79 @@ class PickPlace:
             self.report.cube_lifted = max(self.report.cube_lifted,
                                           float(self.cube_pos()[2]))
             if self.viewer is not None:
-                self.viewer.sync()
+                if not self.viewer.is_running():
+                    self.aborted = True
+                    return
+                self._pace()
+                if float(self.data.time) - self._last_sync >= self.viewer_period:
+                    self._last_sync = float(self.data.time)
+                    self.viewer.sync()
         self.report.sim_time = float(self.data.time)
 
-    def _track(self, grip_target: float) -> bool:
+    def _pace(self) -> None:
+        """Sleep just enough that wall time tracks simulated time."""
+        if not self.realtime:
+            return
+        now = time.perf_counter()
+        if self._wall0 is None:
+            self._wall0 = now
+            self._sim0 = float(self.data.time)
+        lag = (self._wall0 + (float(self.data.time) - self._sim0)) - now
+        if lag > 0:
+            time.sleep(min(lag, 0.05))
+        else:                       # fell behind (slow render): re-anchor
+            self._wall0 = now
+            self._sim0 = float(self.data.time)
+
+    def _track(self, grip_target: float, grip_hold: bool = False,
+               grip_speed: float | None = None,
+               speed: float | None = None) -> bool:
         """Ramp the reference toward _q_target; True once the arm really arrives.
 
         The reference is ramped at a limited speed so the arm does not slam, and
         completion is measured against the FINAL target (not the moving
         reference), otherwise a state would report "arrived" on its first step.
+
+        `grip_hold` is for the states that travel with the payload between the
+        pads.  There the jaw physically cannot obey a tighter command -- it is
+        jammed on the cube -- so comparing the jaw angle with the command never
+        settles and the machine sits still until the cube slowly creeps.  With
+        `grip_hold` only the gripper COMMAND has to arrive; the arm joints still
+        have to reach the target for real.
         """
         delta = self._q_target - self.q_ref
-        step = MAX_JOINT_SPEED * self.model.opt.timestep
+        step = (MAX_JOINT_SPEED if speed is None else speed) * self.model.opt.timestep
         far = float(np.max(np.abs(delta)))
         self.q_ref = (self.q_ref + delta * (step / far)) if far > step else self._q_target.copy()
 
-        gstep = GRIPPER_SPEED * self.model.opt.timestep
+        if grip_speed is None:
+            gspeed = GRIPPER_HOLD_SPEED if grip_hold else GRIPPER_SPEED
+        else:
+            gspeed = grip_speed
+        gstep = gspeed * self.model.opt.timestep
         self.grip_ref += float(np.clip(grip_target - self.grip_ref, -gstep, gstep))
 
         self._step()
         arm_err = float(np.max(np.abs(self.arm.joints() - self._q_target)))
-        grip_err = abs(self.arm.gripper() - grip_target)
-        return arm_err < SETTLE_TOL and grip_err < 0.06
+
+        # Jam watchdog: a blocked arm can sit at a constant error forever (the
+        # pads resting on the cube, the wrist pushing on the table, ...).  If
+        # the error stops improving the state is over -- waiting longer only
+        # looks like the machine has frozen.
+        now = float(self.data.time)
+        if arm_err < self._best_err - STALL_PROGRESS:
+            self._best_err = arm_err
+            self._best_time = now
+        elif now - self._best_time > STALL_WINDOW and arm_err > SETTLE_TOL:
+            if not self._jammed:
+                print("  [%-11s] jammed, %.3f rad short of the target -- moving on"
+                      % (self.state.name, arm_err))
+            self._jammed = True
+        if grip_hold:
+            grip_ok = abs(self.grip_ref - grip_target) < 1e-6
+        else:
+            grip_ok = abs(self.arm.gripper() - grip_target) < GRIPPER_SETTLE
+        return (arm_err < SETTLE_TOL and grip_ok) or self._jammed
 
     def _capture(self, tag: str) -> None:
         if self.renderer is None:
@@ -281,6 +382,11 @@ class PickPlace:
         self.state = state
         self.clock = 0.0
         self._stall = 0
+        self._best_err = float("inf")
+        self._best_time = float(self.data.time)
+        self._jammed = False
+        self._anchor = None
+        self._replans = 0
         self.report.reached_states.append(state.name)
         plan()
         self._capture(state.name.lower())
@@ -301,8 +407,31 @@ class PickPlace:
         return done and self.clock > MIN_DWELL
 
     def _descend(self) -> bool:
+        """Lower onto the cube, re-aiming if the fingers bump it on the way.
+
+        The pads only clear a 20 mm cube by a couple of millimetres, so a
+        descent that is a hair off-centre nudges the cube aside instead of
+        straddling it.  Rather than close on air and waste a whole retry, watch
+        the cube: as soon as it moves, re-plan the descent onto where it is now.
+        """
         self.clock += self.model.opt.timestep
-        return self._track(GRIPPER_OPEN)
+        speed = DESCEND_FAST if float(self.arm.tcp()[2]) > DESCEND_FREE_Z else DESCEND_SPEED
+        done = self._track(GRIPPER_OPEN, speed=speed)
+
+        if self._anchor is None:
+            self._anchor = self.cube_pos()[:2].copy()
+        moved = float(np.linalg.norm(self.cube_pos()[:2] - self._anchor))
+        if moved > NUDGE_LIMIT and self._replans < 3:
+            self._replans += 1
+            print("  [DESCEND    ] cube nudged %.1f mm aside, re-aiming (%d)"
+                  % (moved * 1000, self._replans))
+            self._best_err = float("inf")
+            self._best_time = float(self.data.time)
+            self._jammed = False
+            self._plan_descend()
+            self._anchor = self.cube_pos()[:2].copy()
+            return False
+        return done
 
     def _close(self) -> bool:
         """Squeeze until the fingers stall on the cube (not merely touch it)."""
@@ -336,39 +465,45 @@ class PickPlace:
 
     def _lift(self) -> bool:
         self.clock += self.model.opt.timestep
-        return self._track(GRIPPER_CLOSE)
+        return self._track(GRIPPER_CLOSE, grip_hold=True)
 
     def _move_to_bin(self) -> bool:
         self.clock += self.model.opt.timestep
-        done = self._track(GRIPPER_CLOSE)
-        return done and self.clock > 0.3
+        return self._track(GRIPPER_CLOSE, grip_hold=True)
 
     def _open(self) -> bool:
         self.clock += self.model.opt.timestep
-        done = self._track(GRIPPER_RELEASE)
-        below = float(self.cube_pos()[2])
-        return done and self.clock > 1.2 and below < RELEASE_SITE_Z
+        self._track(GRIPPER_RELEASE, grip_speed=GRIPPER_RELEASE_SPEED)
+        opened = self.arm.gripper() > 0.22          # pads clear of the cube
+        landed = float(self.cube_pos()[2]) < RELEASE_SITE_Z
+        still = float(np.linalg.norm(self.data.qvel[self.cube_dadr])) < 0.05
+        return opened and landed and still and self.clock > 0.10
 
     # -- drivers ---------------------------------------------------------
     def _plan_move_above(self) -> None:
+        roll = self.cube_yaw()
         self._ik_or_warn("MOVE_ABOVE",
                          self.arm.grasp_site_target(self.cube_pos()[:2],
                                                     GRASP_SITE_Z + PREGRASP_CLEARANCE,
-                                                    trim=self.trim),
-                         multi=True)
+                                                    roll=roll, trim=self.trim),
+                         roll=roll, multi=True)
 
     def _plan_descend(self) -> None:
+        roll = self.cube_yaw()
         self._ik_or_warn("DESCEND",
                          self.arm.grasp_site_target(self.cube_pos()[:2], GRASP_SITE_Z,
-                                                    trim=self.trim))
+                                                    roll=roll, trim=self.trim),
+                         roll=roll)
 
     def _plan_close(self) -> None:
         pass
 
     def _plan_lift(self) -> None:
+        roll = self.cube_yaw()
         self._ik_or_warn("LIFT",
                          self.arm.grasp_site_target(self.cube_pos()[:2], CARRY_SITE_Z,
-                                                    trim=self.trim))
+                                                    roll=roll, trim=self.trim),
+                         roll=roll)
 
     def _plan_move_to_bin(self) -> None:
         self._ik_or_warn("MOVE_TO_BIN",
@@ -383,6 +518,9 @@ class PickPlace:
     def _advance(self, state, handlers, plans, max_seconds):
         self._enter(state, plans[state])
         while not handlers[state]():
+            if self.aborted:
+                print("!! viewer closed in %s" % state.name)
+                return False
             if self.data.time > max_seconds:
                 print("!! timeout in %s at t=%.1fs" % (state.name, self.data.time))
                 return False
