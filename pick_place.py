@@ -9,6 +9,12 @@ Six actions, one per state:
     5. MOVE_TO_BIN   carry it over the target bin
     6. OPEN          open the fingers and let the object drop
 
+The targets come from the scene camera, not from the simulator: each attempt
+looks at one RGB frame, finds the cube (colour blob + model-based silhouette
+fit) and the bin, and plans from those coordinates.  Nothing in the completion
+tests uses vision -- those stay on the physics, so a bad detection shows up as a
+missed grasp rather than as a state that claims to be finished.
+
 No human input is involved: each state tests its own completion condition and
 hands over to the next one.  If the grasp slips, the machine retries from
 state 1 (aiming at the cube where it actually lies now), up to MAX_ATTEMPTS.
@@ -35,6 +41,7 @@ Usage:
     python pick_place.py --cube red           # pick another cube
     python pick_place.py --viewer             # watch it in the viewer
     python pick_place.py --frames out/        # write a PNG per transition
+    python pick_place.py --cameras            # live scene + wrist camera windows
 """
 from __future__ import annotations
 
@@ -47,6 +54,8 @@ from typing import Callable
 
 import mujoco
 import numpy as np
+
+import vision
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SCENE = os.path.join(ROOT, "mjcf", "scene.xml")
@@ -85,6 +94,20 @@ STALL_PROGRESS = 0.002      # rad: ...and improve by less than this, the motion
                             #      is jammed (fingers on the cube, table, ...)
                             #      and the state ends instead of waiting forever
 MAX_ATTEMPTS = 3
+
+# A single frame can have the cube hidden behind a jaw or a glare, so one missed
+# detection is retried before it is believed.
+VISION_RETRIES = 3
+
+
+class VisionError(RuntimeError):
+    """Raised when the planner needs a pose that vision never delivered."""
+
+# Perception.  1280x960 is not cosmetic: the cube is only ~55 px across at
+# 640x480, and at that size the yaw fit is off by 2.5 deg on average (8 deg
+# worst case) against 1.1 deg (2.8 worst) at 1280x960.
+PERCEPTION_WIDTH = 1280
+PERCEPTION_HEIGHT = 960
 LIFT_SUCCESS = 0.030        # m: cube rise that counts as a successful grasp
 OFFSET_TRIM = (-0.004, 0.004)   # m: lateral nudges used by the retries
 
@@ -111,6 +134,9 @@ class Report:
     attempts: int = 0
     sim_time: float = 0.0
     frames: list[np.ndarray] = field(default_factory=list)
+    vision_calls: int = 0
+    vision_error_mm: list[float] = field(default_factory=list)
+    bin_vision_error_mm: float = -1.0
 
 
 class Arm:
@@ -208,28 +234,55 @@ class Arm:
 
 
 class PickPlace:
-    def __init__(self, model, data, cube: str, viewer=None, frame_dir: str | None = None):
+    def __init__(self, model, data, cube: str, viewer=None,
+                 frame_dir: str | None = None, use_vision: bool = True,
+                 perception=None, cameras=None):
         self.model = model
         self.data = data
         self.arm = Arm(model, data)
+        self.use_vision = use_vision
+        # One GL context per process: a second mujoco.Renderer alongside a live
+        # one corrupts readbacks under WSLg (measured -- every other frame came
+        # back vertically mirrored).  Pass a shared Perception when looping.
+        self.per = perception
+        if use_vision and self.per is None:
+            self.per = vision.Perception(model, data, PERCEPTION_WIDTH,
+                                         PERCEPTION_HEIGHT)
+        self.seen_cube = None        # vision.Pose of the target, or None
+        self.seen_bin = None         # vision.Pose of the bin, or None
+        self.vision_lost = False
         self.cube = cube
         self.cube_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"cube_{cube}")
         self.cube_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"geom_cube_{cube}")
         self.bin_site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "bin_center")
-        cube_jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"cube_{cube}")
+        cube_jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"joint_cube_{cube}")
         self.cube_dadr = int(model.jnt_dofadr[cube_jid])
         self.finger_geoms = self._finger_geom_ids()
         self.viewer = viewer
+        self.cameras = cameras           # camera_windows.CameraWindows, or None
         self.frame_dir = frame_dir
         self.renderer = None
-        # With a viewer open the run should be watchable, so hold the wall
-        # clock to the simulation clock.  Headless runs go flat out.
-        self.realtime = viewer is not None
+        # With a viewer (or camera windows) open the run should be watchable, so
+        # hold the wall clock to the simulation clock.  Headless runs go flat out.
+        self.realtime = viewer is not None or cameras is not None
         self._wall0 = None
         self._sim0 = 0.0
         self.aborted = False
         self._last_sync = -1.0
         self.viewer_period = 1.0 / 60.0     # s of simulated time between redraws
+        # Camera windows are expensive per frame (~65 ms wall for two 640x480
+        # views), so they are throttled on the wall clock at a real fps instead
+        # of on simulated time.  Without this the run drifts to 3x real time.
+        self._cam_period = 1.0 / getattr(cameras, "fps", 10.0) if cameras else 0.0
+        self._last_cam = -1e9
+        # The camera windows may spend at most this share of real time drawing.
+        # A fixed fps alone cannot bound that: each pair of 640x480 views costs
+        # ~65 ms here, so 10 fps would be a 65% duty cycle and the run would
+        # never keep up.  Both rules are enforced together -- the fps cap keeps
+        # motion smooth, the duty cap keeps the run in real time.
+        self._cam_budget = float(getattr(cameras, "budget", 0.60)) if cameras else 0.0
+        self._cam_spent = 0.0            # seconds spent drawing
+        self._cam_wall0 = None
         self.report = Report(cube=cube)
 
         self.q_ref = self.arm.joints()
@@ -247,7 +300,10 @@ class PickPlace:
 
         if frame_dir:
             os.makedirs(frame_dir, exist_ok=True)
-            self.renderer = mujoco.Renderer(model, 480, 640)
+            # Do NOT add a second mujoco.Renderer while perception holds one:
+            # under WSLg that makes readbacks alternate into vertical mirrors.
+            if self.per is None:
+                self.renderer = mujoco.Renderer(model, 480, 640)
 
     # -- helpers ---------------------------------------------------------
     def _finger_geom_ids(self) -> set[int]:
@@ -277,6 +333,89 @@ class PickPlace:
     def bin_center(self) -> np.ndarray:
         return self.data.site_xpos[self.bin_site].copy()
 
+    # -- perception ------------------------------------------------------
+    def look_cube(self) -> bool:
+        """One camera frame -> where the target cube is.
+
+        Returns False if the cube could not be seen, in which case planning
+        falls back to the last pose that was seen (or to ground truth if it was
+        never seen at all) -- the controller must not stall because one frame
+        had a bad blob.
+        """
+        if self.per is None:
+            return False
+        t0 = time.perf_counter()
+        pose = None
+        for _ in range(VISION_RETRIES):
+            pose = self.per.find_cube(self.cube)
+            if pose is not None:
+                break
+        ms = 1000 * (time.perf_counter() - t0)
+        if pose is None:
+            self.vision_lost = True
+            print(f"  [VISION     ] cube_{self.cube} not visible in "
+                  f"{VISION_RETRIES} frame(s)")
+            return False
+        self.seen_cube = pose
+        truth = self.cube_pos()
+        err = 1000 * float(np.hypot(pose.xy[0] - truth[0], pose.xy[1] - truth[1]))
+        dyaw = (np.degrees(pose.yaw - self.cube_yaw()) + 45.0) % 90.0 - 45.0
+        print(f"  [VISION     ] cube_{self.cube} at ({pose.xy[0]:.4f}, {pose.xy[1]:.4f}) "
+              f"yaw {np.degrees(pose.yaw):+6.1f} deg  IoU {pose.score:.3f}  {ms:.0f} ms"
+              f"   [truth {err:.1f} mm / {dyaw:+.1f} deg]")
+        self.report.vision_calls += 1
+        self.report.vision_error_mm.append(err)
+        return True
+
+    def look_bin(self) -> bool:
+        """One frame -> where the bin is (retried like look_cube).
+
+        A single frame is not enough: the grey mask that outlines the bin is
+        borderline, and in one run with the camera windows open a single frame
+        returned nothing while an immediate re-render of the same state was
+        detected cleanly (pixel difference 0.00, so not a readback fault).
+        """
+        if self.per is None:
+            return False
+        t0 = time.perf_counter()
+        pose = None
+        for _ in range(VISION_RETRIES):
+            pose = self.per.find_bin()
+            if pose is not None:
+                break
+        ms = 1000 * (time.perf_counter() - t0)
+        if pose is None:
+            print("  [VISION     ] bin not visible in %d frame(s)" % VISION_RETRIES)
+            return False
+        self.seen_bin = pose
+        truth = self.bin_center()
+        err = 1000 * float(np.hypot(pose.xy[0] - truth[0], pose.xy[1] - truth[1]))
+        print(f"  [VISION     ] bin at ({pose.xy[0]:.4f}, {pose.xy[1]:.4f})  "
+              f"IoU {pose.score:.3f}  {ms:.0f} ms   [truth {err:.1f} mm]")
+        self.report.bin_vision_error_mm = err
+        self.report.vision_calls += 1
+        return True
+
+    def target_cube(self) -> tuple[np.ndarray, float]:
+        """Where the cube is, according to vision.
+
+        Without vision (``--no-vision``) the simulator is the sensor.  With it,
+        never fall back to the simulator: a silent fallback would make a missed
+        detection indistinguishable from a working one.
+        """
+        if self.seen_cube is not None:
+            return self.seen_cube.xy, float(self.seen_cube.yaw)
+        if not self.use_vision:
+            return self.cube_pos()[:2], self.cube_yaw()
+        raise VisionError(f"cube_{self.cube} was never seen")
+
+    def target_bin(self) -> np.ndarray:
+        if self.seen_bin is not None:
+            return self.seen_bin.xy
+        if not self.use_vision:
+            return self.bin_center()[:2]
+        raise VisionError("bin was never seen")
+
     def touching(self) -> bool:
         for i in range(self.data.ncon):
             c = self.data.contact[i]
@@ -292,30 +431,64 @@ class PickPlace:
             mujoco.mj_step(self.model, self.data)
             self.report.cube_lifted = max(self.report.cube_lifted,
                                           float(self.cube_pos()[2]))
-            if self.viewer is not None:
-                if not self.viewer.is_running():
+            if self.viewer is not None or self.cameras is not None:
+                if self.viewer is not None and not self.viewer.is_running():
+                    self.aborted = True
+                    return
+                if self.cameras is not None and not self.cameras.alive():
+                    self.cameras.closed = True
+                    print("!! camera windows closed in %s" % self.state.name)
                     self.aborted = True
                     return
                 self._pace()
-                if float(self.data.time) - self._last_sync >= self.viewer_period:
+                if self.viewer is not None and \
+                        float(self.data.time) - self._last_sync >= self.viewer_period:
                     self._last_sync = float(self.data.time)
                     self.viewer.sync()
+                if self.cameras is not None:
+                    # Wall-clock throttle, not simulated time: a sim-time
+                    # throttle (60 redraws per simulated second) made a 3 s run
+                    # take 10 s.  The duty cap bounds the total cost instead.
+                    now = time.perf_counter()
+                    if self._cam_wall0 is None:
+                        self._cam_wall0 = now
+                    elapsed = now - self._cam_wall0
+                    due = now - self._last_cam >= self._cam_period
+                    affordable = self._cam_spent <= self._cam_budget * elapsed
+                    if due:
+                        self._last_cam = now
+                        if affordable:
+                            self._cam_spent += self.cameras.tick("%-11s" % self.state.name)
+                        else:
+                            self.cameras.dropped += 1   # budget used up
         self.report.sim_time = float(self.data.time)
 
-    def _pace(self) -> None:
-        """Sleep just enough that wall time tracks simulated time."""
+    def _pace(self) -> float:
+        """Sleep just enough that wall time tracks simulated time.
+
+        Returns the signed lag in seconds: > 0 means the run is LATE (an
+        expensive redraw just happened), < 0 means it is early and slept.
+
+        The baseline is deliberately NOT re-anchored just because we fall behind:
+        re-anchoring would forgive the time spent rendering, so the animation
+        would never catch up and the whole run would slow to the renderer's
+        pace (measured: 3.08 s of motion taking 10.2 s of wall time).  Instead
+        the deficit is paid back by running the physics flat out for a moment.
+        """
         if not self.realtime:
-            return
+            return 0.0
         now = time.perf_counter()
         if self._wall0 is None:
             self._wall0 = now
             self._sim0 = float(self.data.time)
-        lag = (self._wall0 + (float(self.data.time) - self._sim0)) - now
-        if lag > 0:
-            time.sleep(min(lag, 0.05))
-        else:                       # fell behind (slow render): re-anchor
+        behind = now - (self._wall0 + (float(self.data.time) - self._sim0))
+        if behind > 2.0:            # absurd backlog (debugger, swap storm): reset
             self._wall0 = now
             self._sim0 = float(self.data.time)
+            return 0.0
+        if behind < 0:
+            time.sleep(min(-behind, 0.05))
+        return behind
 
     def _track(self, grip_target: float, grip_hold: bool = False,
                grip_speed: float | None = None,
@@ -368,10 +541,13 @@ class PickPlace:
         return (arm_err < SETTLE_TOL and grip_ok) or self._jammed
 
     def _capture(self, tag: str) -> None:
-        if self.renderer is None:
+        if self.per is not None:
+            img = self.per.render()          # share the one GL context
+        elif self.renderer is not None:
+            self.renderer.update_scene(self.data, camera="scene_cam")
+            img = self.renderer.render()
+        else:
             return
-        self.renderer.update_scene(self.data, camera="scene_cam")
-        img = self.renderer.render()
         self.report.frames.append(img)
         if self.frame_dir:
             from PIL import Image
@@ -481,17 +657,20 @@ class PickPlace:
 
     # -- drivers ---------------------------------------------------------
     def _plan_move_above(self) -> None:
-        roll = self.cube_yaw()
+        if self.use_vision:
+            self.look_cube()
+        xy, roll = self.target_cube()
         self._ik_or_warn("MOVE_ABOVE",
-                         self.arm.grasp_site_target(self.cube_pos()[:2],
-                                                    GRASP_SITE_Z + PREGRASP_CLEARANCE,
+                         self.arm.grasp_site_target(xy, GRASP_SITE_Z + PREGRASP_CLEARANCE,
                                                     roll=roll, trim=self.trim),
                          roll=roll, multi=True)
 
     def _plan_descend(self) -> None:
-        roll = self.cube_yaw()
+        if self.use_vision and (self._replans or self.seen_cube is None):
+            self.look_cube()       # re-aiming after a nudge: look again
+        xy, roll = self.target_cube()
         self._ik_or_warn("DESCEND",
-                         self.arm.grasp_site_target(self.cube_pos()[:2], GRASP_SITE_Z,
+                         self.arm.grasp_site_target(xy, GRASP_SITE_Z,
                                                     roll=roll, trim=self.trim),
                          roll=roll)
 
@@ -499,27 +678,38 @@ class PickPlace:
         pass
 
     def _plan_lift(self) -> None:
-        roll = self.cube_yaw()
+        xy, roll = self.target_cube()
         self._ik_or_warn("LIFT",
-                         self.arm.grasp_site_target(self.cube_pos()[:2], CARRY_SITE_Z,
+                         self.arm.grasp_site_target(xy, CARRY_SITE_Z,
                                                     roll=roll, trim=self.trim),
                          roll=roll)
 
     def _plan_move_to_bin(self) -> None:
+        if self.use_vision and self.seen_bin is None:
+            self.look_bin()
         self._ik_or_warn("MOVE_TO_BIN",
-                         self.arm.grasp_site_target(self.bin_center()[:2], CARRY_SITE_Z,
+                         self.arm.grasp_site_target(self.target_bin(), CARRY_SITE_Z,
                                                     trim=self.trim), multi=True)
 
     def _plan_open(self) -> None:
         self._ik_or_warn("OPEN",
-                         self.arm.grasp_site_target(self.bin_center()[:2], RELEASE_SITE_Z,
+                         self.arm.grasp_site_target(self.target_bin(), RELEASE_SITE_Z,
                                                     trim=self.trim))
+
+    def _park(self) -> None:
+        """Open the fingers and hold still, so a retry starts from a clean pose."""
+        self.grip_ref = GRIPPER_OPEN
+        self.q_ref = self.arm.joints().copy()
+        self._q_target = self.q_ref.copy()
+        self._jammed = False
+        for _ in range(60):
+            self._step()
 
     def _advance(self, state, handlers, plans, max_seconds):
         self._enter(state, plans[state])
         while not handlers[state]():
             if self.aborted:
-                print("!! viewer closed in %s" % state.name)
+                print("!! run stopped in %s" % state.name)
                 return False
             if self.data.time > max_seconds:
                 print("!! timeout in %s at t=%.1fs" % (state.name, self.data.time))
@@ -551,6 +741,12 @@ class PickPlace:
         }
         grasp_states = (State.MOVE_ABOVE, State.DESCEND, State.CLOSE, State.LIFT)
 
+        if self.use_vision:
+            print("perception   : %dx%d from %s"
+                  % (PERCEPTION_WIDTH, PERCEPTION_HEIGHT, self.per.cam.name))
+        else:
+            print("perception   : off (using simulator ground truth)")
+
         lifted = False
         for attempt in range(MAX_ATTEMPTS):
             self.report.attempts = attempt + 1
@@ -560,11 +756,17 @@ class PickPlace:
                 print("-- grasp attempt %d (lateral trim %+.0f mm)"
                       % (attempt + 1, self.trim * 1000))
             z0 = float(self.cube_pos()[2])
-            for state in grasp_states:
-                if not self._advance(state, handlers, plans, max_seconds):
-                    self.report.cube_final = self.cube_pos()
-                    self.state = State.DONE
-                    return self.report
+            self.seen_cube = None      # look again at the start of each attempt
+            try:
+                for state in grasp_states:
+                    if not self._advance(state, handlers, plans, max_seconds):
+                        self.report.cube_final = self.cube_pos()
+                        self.state = State.DONE
+                        return self.report
+            except VisionError as exc:
+                print("!! %s -- attempt %d abandoned" % (exc, attempt + 1))
+                self._park()           # open the fingers before retrying
+                continue
             rose = 1000 * (float(self.cube_pos()[2]) - z0)
             if rose > LIFT_SUCCESS * 1000 and float(self.cube_pos()[2]) > 0.035:
                 lifted = True
@@ -572,9 +774,12 @@ class PickPlace:
             print("   cube stayed on the table (rose %+.1f mm)" % rose)
 
         if lifted:
-            for state in (State.MOVE_TO_BIN, State.OPEN):
-                if not self._advance(state, handlers, plans, max_seconds):
-                    break
+            try:
+                for state in (State.MOVE_TO_BIN, State.OPEN):
+                    if not self._advance(state, handlers, plans, max_seconds):
+                        break
+            except VisionError as exc:
+                print("!! %s -- carrying the cube still counted" % exc)
         self.state = State.DONE
         self.report.cube_final = self.cube_pos()
         return self.report
@@ -585,8 +790,23 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cube", default="green", choices=["red", "green", "blue"])
     ap.add_argument("--viewer", action="store_true", help="show the MuJoCo viewer")
+    ap.add_argument("--cameras", action="store_true",
+                    help="open two live windows: scene_cam and wrist_cam")
+    ap.add_argument("--camera-size", default="640x480",
+                    help="size of each camera window, WxH (default 640x480)")
+    ap.add_argument("--camera-fps", type=float, default=12.0,
+                    help="cap on camera-window redraw rate (each pair of 640x480 "
+                         "views costs ~65 ms here, so above ~15 fps frames are "
+                         "dropped and the run slows down)")
+    ap.add_argument("--camera-budget", type=float, default=0.60,
+                    help="max share of wall time the windows may spend drawing; "
+                         "raise for smoother video, lower to keep the run brisk")
+    ap.add_argument("--no-shadows", action="store_true",
+                    help="skip the shadow pass in the camera windows (~2x faster)")
     ap.add_argument("--frames", default=None, help="directory for PNG frames")
     ap.add_argument("--seconds", type=float, default=40.0)
+    ap.add_argument("--no-vision", action="store_true",
+                    help="plan from the simulator's ground truth instead of the camera")
     args = ap.parse_args()
 
     model = mujoco.MjModel.from_xml_path(SCENE)
@@ -596,13 +816,23 @@ def main() -> int:
     mujoco.mj_forward(model, data)
 
     viewer = None
+    cameras = None
     try:
         if args.viewer:
             from mujoco import viewer as mj_viewer
             viewer = mj_viewer.launch_passive(model, data)
+        if args.cameras:
+            import camera_windows
+            w, h = (int(v) for v in args.camera_size.lower().split("x"))
+            cameras = camera_windows.CameraWindows(
+                model, data, width=w, height=h, fps=args.camera_fps,
+                shadows=not args.no_shadows, budget=args.camera_budget)
         report = PickPlace(model, data, args.cube, viewer=viewer,
-                           frame_dir=args.frames).run(max_seconds=args.seconds)
+                           frame_dir=args.frames, cameras=cameras,
+                           use_vision=not args.no_vision).run(max_seconds=args.seconds)
     finally:
+        if cameras is not None:
+            cameras.close()
         if viewer is not None:
             viewer.close()
 
@@ -615,6 +845,13 @@ def main() -> int:
     print("peak height: %.4f m" % report.cube_lifted)
     print("cube final :", np.round(report.cube_final, 4))
     print("bin centre :", np.round(report.bin_center, 4))
+
+    if report.vision_calls:
+        errs = np.array(report.vision_error_mm) if report.vision_error_mm else np.zeros(1)
+        print("vision     : %d frame(s), cube error mean %.2f mm, max %.2f mm%s"
+              % (report.vision_calls, errs.mean(), errs.max(),
+                 "" if report.bin_vision_error_mm < 0
+                 else ", bin error %.2f mm" % report.bin_vision_error_mm))
 
     xy_err = float(np.linalg.norm(report.cube_final[:2] - report.bin_center[:2]))
     lifted = report.cube_lifted > 0.045
