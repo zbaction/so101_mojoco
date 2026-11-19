@@ -22,6 +22,10 @@ python pick_place.py --no-vision         # 关掉视觉，改用仿真真值规�
 python pick_place.py --cameras           # 边跑边开两个实时相机窗口（全景 + 腕部）
 
 python vision_demo.py                    # 渲染一帧，把识别结果画在图上存成 vision_demo.png
+
+python stack_cubes.py                    # 三个方块叠成一座塔（见下）
+python stack_cubes.py --viewer           # 看这座塔
+python stack_cubes.py --cameras          # 两个相机窗口里看这座塔
 ```
 
 ## 文件
@@ -34,6 +38,7 @@ python vision_demo.py                    # 渲染一帧，把识别结果画在�
 | `vision.py` | 视觉感知：颜色分割 + 已知几何体的位姿拟合 |
 | `vision_demo.py` | 识别结果可视化（画框 + 标注并存图） |
 | `camera_windows.py` | 两个实时相机窗口（`scene_cam` + `wrist_cam`），可单独运行 |
+| `stack_cubes.py` | 三个方块叠成一摞的场景（生成 `mjcf/scene_stack.xml` 并可预览） |
 | `view_scene.py` | 交互式查看器入口 |
 | `capture_cameras.py` | 离屏渲染两个相机到 PNG |
 
@@ -231,6 +236,48 @@ python pick_place.py --cube blue     RESULT: PASS   峰值 71.8 mm  落点误差
 
 - 快速张开夹爪会把方块**弹飞 13 mm**，所以释放动作单独用 0.45 rad/s，比抓取动作慢。
 - 下降途中手指会蹭到方块。加了「方块位移 > 2.5 mm 就重新瞄准」后，下降不再把方块推走。
+
+## 三个方块叠成一摞 (`stack_cubes.py`)
+
+`scene.xml` 里红/绿/蓝三个方块是平铺在桌面上的。这个脚本生成一份布局相同、但把三个方块**竖直叠成一座塔**的场景
+（`mjcf/scene_stack.xml`），机械臂、桌面、收纳盒、两个相机都保持不变。
+
+```bash
+python stack_cubes.py --rebuild          # 从 scene.xml 重新生成 mjcf/scene_stack.xml
+python stack_cubes.py                    # 落定 2 s 后打印每块的高度与层间距
+python stack_cubes.py --viewer           # 交互式看这座塔
+python stack_cubes.py --cameras          # 两个实时相机窗口
+python stack_cubes.py --save out/        # 导出 scene_cam / wrist_cam 两张 1280x960 PNG
+```
+
+叠放参数（脚本顶部常量，改这里比改 XML 安全）：
+
+| 常量 | 值 | 说明 |
+| --- | --- | --- |
+| `TOWER_XY` | `(0.215, -0.045)` | 塔的位置，就是原来绿方块所在处 |
+| `STACK` | `("red","green","blue")` | 自下而上 |
+| `BOTTOM_Z` | `0.0102` | 最底层方块的中心高度（方块半高 10 mm，桌面 z=0） |
+| `CUBE_HEIGHT` | `0.020` | 方块边长，也是层间距 |
+
+每块留 `0.0002 m` 的初始间隙，避免求解器从互相嵌入开始；三块各带一点点互不相同的偏航（0.10 / −0.06 / 0.22 rad），
+看起来像手叠的而不是 CAD 对齐的。
+
+### 实测
+
+```
+stack: red -> green -> blue (bottom -> top)
+  red    ( 0.2150, -0.0450,  0.0100) m
+  green  ( 0.2150, -0.0450,  0.0300) m
+  blue   ( 0.2150, -0.0450,  0.0500) m
+  level spacing: 19.99, 20.00 mm
+  tower height: 59.8 mm (top face at z = 0.060 m)
+  STACK_INTACT
+```
+
+放在那里跑 10 s 仿真，三层中心相对初始位置漂移分别 0.22 / 0.43 / 0.63 mm，层间距始终保持 20 mm，塔不塌。
+
+> 这只是**场景布局**。`pick_place.py` 抓的是桌面上自由躺着的方块；从一摞里抽出中间或底下的那一块是另一个任务，
+> 所以抓放控制器仍然对着 `scene.xml` 跑。
 
 ## 实时相机窗口 (`camera_windows.py`)
 
