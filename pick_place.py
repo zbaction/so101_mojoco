@@ -236,7 +236,9 @@ class Arm:
 class PickPlace:
     def __init__(self, model, data, cube: str, viewer=None,
                  frame_dir: str | None = None, use_vision: bool = True,
-                 perception=None, cameras=None):
+                 perception=None, cameras=None,
+                 grasp_z=None, carry_z=None, release_z=None,
+                 lift_rise=None, drop_xy=None):
         self.model = model
         self.data = data
         self.arm = Arm(model, data)
@@ -284,6 +286,39 @@ class PickPlace:
         self._cam_spent = 0.0            # seconds spent drawing
         self._cam_wall0 = None
         self.report = Report(cube=cube)
+
+        # Per-pick heights.  A cube sitting on the table has its centre at
+        # GRASP_SITE_Z (10 mm); a cube stacked on two others has its centre
+        # 40 mm higher, so the grasp / approach / carry heights can no longer
+        # be module constants.  Each pick overrides them; the defaults
+        # reproduce the single-cube run exactly.
+        self.grasp_z = float(GRASP_SITE_Z if grasp_z is None else grasp_z)
+        self.carry_z = float(CARRY_SITE_Z if carry_z is None else carry_z)
+        self.release_z = float(RELEASE_SITE_Z if release_z is None else release_z)
+        # Approach a little above the grasp height.  The cap is 0.080, not the
+        # last reachable height: at 0.092 the stretched pose solves ~1 mm /
+        # 1 deg off vertical, and a 1-deg-tilted palm digs into the top cube
+        # in the stack and shoves it aside.  At 0.080 the approach is clean
+        # (sweep over 0.044-0.052 grasp heights: 0.092 cap knocks the top
+        # cube off the tower, 0.080 cap grips and bins it every time).
+        self.pregrasp_z = min(self.grasp_z + PREGRASP_CLEARANCE, 0.080)
+        # Switch from the fast descent to the slow final approach 22 mm above
+        # the grasp height, wherever that is.
+        self.descend_free_z = self.grasp_z + 0.022
+        # How far the cube must rise to count as lifted.  A raised grasp has
+        # less room between its start height and the carry height, so scale
+        # the threshold down (never below 8 mm: a real grip always clears that).
+        if lift_rise is None:
+            self.lift_rise = min(LIFT_SUCCESS,
+                                 max(0.008, self.carry_z - self.grasp_z - 0.005))
+        else:
+            self.lift_rise = float(lift_rise)
+
+        # Where the cube is put down.  None -> the bin (located by vision).
+        # An explicit (x, y) -> a staging spot on the table; pick_any uses
+        # this to park the cubes that sit on top of the one the user asked
+        # for, instead of dumping everything into the bin.
+        self.drop_xy = None if drop_xy is None else np.asarray(drop_xy, dtype=float)[:2]
 
         self.q_ref = self.arm.joints()
         self.grip_ref = GRIPPER_OPEN
@@ -347,7 +382,9 @@ class PickPlace:
         t0 = time.perf_counter()
         pose = None
         for _ in range(VISION_RETRIES):
-            pose = self.per.find_cube(self.cube)
+            # Fit at the known grasp height: unprojecting a raised cube as if
+            # it sat on the table would shift its x,y by tens of millimetres.
+            pose = self.per.find_cube(self.cube, centre_z=self.grasp_z)
             if pose is not None:
                 break
         ms = 1000 * (time.perf_counter() - t0)
@@ -415,6 +452,14 @@ class PickPlace:
         if not self.use_vision:
             return self.bin_center()[:2]
         raise VisionError("bin was never seen")
+
+    def target_drop(self) -> np.ndarray:
+        """Where to release the cube: the bin, or an explicit staging xy."""
+        if self.drop_xy is not None:
+            return self.drop_xy
+        if self.use_vision and self.seen_bin is None:
+            self.look_bin()
+        return self.target_bin()
 
     def touching(self) -> bool:
         for i in range(self.data.ncon):
@@ -591,7 +636,7 @@ class PickPlace:
         the cube: as soon as it moves, re-plan the descent onto where it is now.
         """
         self.clock += self.model.opt.timestep
-        speed = DESCEND_FAST if float(self.arm.tcp()[2]) > DESCEND_FREE_Z else DESCEND_SPEED
+        speed = DESCEND_FAST if float(self.arm.tcp()[2]) > self.descend_free_z else DESCEND_SPEED
         done = self._track(GRIPPER_OPEN, speed=speed)
 
         if self._anchor is None:
@@ -651,7 +696,7 @@ class PickPlace:
         self.clock += self.model.opt.timestep
         self._track(GRIPPER_RELEASE, grip_speed=GRIPPER_RELEASE_SPEED)
         opened = self.arm.gripper() > 0.22          # pads clear of the cube
-        landed = float(self.cube_pos()[2]) < RELEASE_SITE_Z
+        landed = float(self.cube_pos()[2]) < self.release_z
         still = float(np.linalg.norm(self.data.qvel[self.cube_dadr])) < 0.05
         return opened and landed and still and self.clock > 0.10
 
@@ -661,7 +706,7 @@ class PickPlace:
             self.look_cube()
         xy, roll = self.target_cube()
         self._ik_or_warn("MOVE_ABOVE",
-                         self.arm.grasp_site_target(xy, GRASP_SITE_Z + PREGRASP_CLEARANCE,
+                         self.arm.grasp_site_target(xy, self.pregrasp_z,
                                                     roll=roll, trim=self.trim),
                          roll=roll, multi=True)
 
@@ -670,7 +715,7 @@ class PickPlace:
             self.look_cube()       # re-aiming after a nudge: look again
         xy, roll = self.target_cube()
         self._ik_or_warn("DESCEND",
-                         self.arm.grasp_site_target(xy, GRASP_SITE_Z,
+                         self.arm.grasp_site_target(xy, self.grasp_z,
                                                     roll=roll, trim=self.trim),
                          roll=roll)
 
@@ -680,20 +725,18 @@ class PickPlace:
     def _plan_lift(self) -> None:
         xy, roll = self.target_cube()
         self._ik_or_warn("LIFT",
-                         self.arm.grasp_site_target(xy, CARRY_SITE_Z,
+                         self.arm.grasp_site_target(xy, self.carry_z,
                                                     roll=roll, trim=self.trim),
                          roll=roll)
 
     def _plan_move_to_bin(self) -> None:
-        if self.use_vision and self.seen_bin is None:
-            self.look_bin()
         self._ik_or_warn("MOVE_TO_BIN",
-                         self.arm.grasp_site_target(self.target_bin(), CARRY_SITE_Z,
+                         self.arm.grasp_site_target(self.target_drop(), self.carry_z,
                                                     trim=self.trim), multi=True)
 
     def _plan_open(self) -> None:
         self._ik_or_warn("OPEN",
-                         self.arm.grasp_site_target(self.target_bin(), RELEASE_SITE_Z,
+                         self.arm.grasp_site_target(self.target_drop(), self.release_z,
                                                     trim=self.trim))
 
     def _park(self) -> None:
@@ -768,7 +811,7 @@ class PickPlace:
                 self._park()           # open the fingers before retrying
                 continue
             rose = 1000 * (float(self.cube_pos()[2]) - z0)
-            if rose > LIFT_SUCCESS * 1000 and float(self.cube_pos()[2]) > 0.035:
+            if rose > self.lift_rise * 1000 and float(self.cube_pos()[2]) > self.grasp_z + 0.008:
                 lifted = True
                 break
             print("   cube stayed on the table (rose %+.1f mm)" % rose)

@@ -26,6 +26,9 @@ python vision_demo.py                    # 渲染一帧，把识别结果画在�
 python stack_cubes.py                    # 三个方块叠成一座塔（见下）
 python stack_cubes.py --viewer           # 看这座塔
 python stack_cubes.py --cameras          # 两个相机窗口里看这座塔
+
+python pick_any.py                       # 从摞里把方块逐个夹进收纳盒（见下）
+python pick_any.py --cube green          # 只把指定颜色放进盒子，其余搬到一边
 ```
 
 ## 文件
@@ -39,6 +42,7 @@ python stack_cubes.py --cameras          # 两个相机窗口里看这座塔
 | `vision_demo.py` | 识别结果可视化（画框 + 标注并存图） |
 | `camera_windows.py` | 两个实时相机窗口（`scene_cam` + `wrist_cam`），可单独运行 |
 | `stack_cubes.py` | 三个方块叠成一摞的场景（生成 `mjcf/scene_stack.xml` 并可预览） |
+| `pick_any.py` | 从摞里夹指定方块进收纳盒，其余搬到一边（按实测层高自适应，见下） |
 | `view_scene.py` | 交互式查看器入口 |
 | `capture_cameras.py` | 离屏渲染两个相机到 PNG |
 
@@ -276,8 +280,91 @@ stack: red -> green -> blue (bottom -> top)
 
 放在那里跑 10 s 仿真，三层中心相对初始位置漂移分别 0.22 / 0.43 / 0.63 mm，层间距始终保持 20 mm，塔不塌。
 
-> 这只是**场景布局**。`pick_place.py` 抓的是桌面上自由躺着的方块；从一摞里抽出中间或底下的那一块是另一个任务，
-> 所以抓放控制器仍然对着 `scene.xml` 跑。
+> 这只是**场景布局**。`pick_place.py` 抓的是桌面上自由躺着的方块；从一摞里夹任意一块（含中层/底层）由
+> `pick_any.py` 负责，见下一节。
+
+## 从一摞里夹任意方块 (`pick_any.py`)
+
+`stack_cubes.py` 把三块叠成一摞之后，`pick_place.py` 只会抓桌面上自由躺着的方块——从摞里直接抽中层或底层会把整摞撞翻。
+`pick_any.py` 专门做这个任务，而且**不是把所有方块都丢进收纳盒**：它对每块做一次决策。
+
+```bash
+python pick_any.py                 # 全部搬进收纳盒（清塔）
+python pick_any.py --cube red      # 只把红色放进盒子；蓝、绿搬到桌面旁边
+python pick_any.py --cube green    # 只把绿色放进盒子；蓝搬到桌面旁边
+python pick_any.py --cube blue     # 蓝色本来就在塔顶：直接放进盒子
+python pick_any.py --viewer        # 边跑边看
+python pick_any.py --cameras       # 两个实时相机窗口
+python pick_any.py --frames out/   # 每个阶段存一张 scene_cam PNG
+```
+
+### 机器人的决策：要的那块进盒，挡路的搬到一边
+
+塔是按顺序叠的，要拿中间/底下那块，必须先把它上面的清走。但“清走”不等于“丢进盒子”。所以每抓起一块塔顶方块时，机器人判断：
+
+- **它就是你要的那块**（或你没指定 `--cube`）→ 放进**收纳盒**；若是目标，本轮即结束；
+- **它不是你要的那块**（只是压在目标上面）→ **搬到桌面旁边的停车位**（塔两侧各一个，`(0.180,-0.115)` 与 `(0.250,-0.115)`），不碰收纳盒。
+
+于是 `--cube red` 的结果是：蓝、绿被放在桌上，**只有红色进盒**。停车位离塔和盒子都 >55 mm，
+IK 在 0.010 / 0.030 / 0.065 三个高度都是 0.00 mm 误差（`PickPlace` 为此新增了 `drop_xy` 参数：为 `None` 时进盒，给定 `(x,y)` 时放到桌面的指定点）。
+
+### 为什么必须从塔顶往下一个一个来
+
+平行夹爪只能从上方下探。中层/底层的方块被上面的压着，手掌（`geom 27`，60×65×144 mm）在下探时会先撞到上层，
+把整摞推倒——直接抓中层/底层会把塔撞翻。所以中间/底下的方块，只有先把上面的搬走（搬到停车位）、让它变成塔顶，才能抓。
+“夹任何一个”＝“点名任意一块，先把它上面的搬到一边，再夹它”。
+
+### 视觉怎么知道该抓哪一块、抓多高
+
+`vision.find_all_cubes_3d()` 一帧里给每块一个 `(x, y, yaw, z)`。被上层压住的方块 z 拟合并不可靠，
+但**塔顶那块永远完全可见**，所以每轮只取“还在塔上、z 最高”的那块当塔顶，它的 z 是可信的。
+实测塔顶蓝块 z=0.046（真值 0.050），再**吸附到最近的 20 mm 层高**（0.010 / 0.030 / 0.050）得到抓取高度，
+拟合偏置就被这条物理先验抹平了。
+
+识别里还有一处关键：`find_cube` 现在接受 `centre_z`，用**已知抓取高度**做反投影。
+否则把塔顶的方块当成“贴着桌面”来反投影，x、y 会偏出几十毫米（实测 49.7 mm），直接把机械臂引到空气里。
+
+### 高度是逐块参数化的
+
+原来的抓取/搬运/释放高度是模块常量（只适合桌面上的单块）。现在 `PickPlace` 接受
+`grasp_z / carry_z / release_z / lift_rise`，默认值与原行为逐位相同。每抓一块前按实测层高传参：
+
+| 参数 | 塔顶层 | 中层 | 底层 |
+|---|---|---|---|
+| `grasp_z`（夹爪停靠点高度） | 0.050 | 0.030 | 0.010 |
+| `carry_z`（搬运高度） | 0.070 | 0.065 | 0.065 |
+| `lift_rise`（算作抬起的抬升量） | 0.015 | 0.030 | 0.030 |
+
+`carry_z` 封顶 0.075：更高的搬运高度在收纳盒上方 IK 解不准（0.080 → 1.41 mm，0.085 → 3.92 mm）。
+
+### 下探高度这个坑（决定了成败）
+
+接近高度（`pregrasp_z`）最初沿用“能到达的最高点”0.092 m。但塔顶抓取时这个高度让机械臂伸到几乎极限，
+IK 解有约 1 mm / 1° 的残差，**那 1° 的倾斜让手掌边缘啃进塔顶方块，把方块顶偏**（日志里 `cube nudged 2.6 mm aside` 反复出现）。
+抓取高度 0.044–0.052 的扫描显示：0.092 封顶时塔顶方块被顶下塔，0.080 封顶时每次都稳稳夹起并进盒。
+所以 `pregrasp_z = min(grasp_z + 0.065, 0.080)`。
+
+### 实测
+
+```
+$ python pick_any.py --cube red
+pick 1: cube_blue  decision: NOT the target (red wanted) -> PARK aside at (0.180, -0.115)
+pick 2: cube_green decision: NOT the target (red wanted) -> PARK aside at (0.250, -0.115)
+pick 3: cube_red   decision: this is the target -> put it IN THE BIN
+SUMMARY
+  cube_blue   PARKED on table (3 mm from its slot)
+  cube_green  PARKED on table (7 mm from its slot)
+  cube_red    xy-to-bin   6.7 mm  IN BIN
+RESULT: PASS - only cube_red is in the bin; cube_blue, cube_green parked on the table.
+```
+
+其它场景：`--cube green`（蓝被停到一边、绿进盒）、`--cube blue`（蓝色直接在塔顶、进盒）都 PASS；
+不带 `--cube` 时退回“整摞清进盒子”的老行为（三块全部 IN BIN）。`--viewer` 下同样 PASS。
+
+### 每抓一块之间会回一次“家”
+
+抓完一块后机械臂停在收纳盒上方。若直接从盒子上方规划下一块的接近姿态，关节插值可能扫过塔。所以每抓一块之间
+用 `retract()` 把关节插值回初始的 home 姿态（走的是同一套限速跟踪器，纯关节空间，不会扫过塔），再开始下一块。
 
 ## 实时相机窗口 (`camera_windows.py`)
 
